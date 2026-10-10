@@ -1,0 +1,40 @@
+{
+  "reference": "OpenSfM pyfeatures.hahog",
+  "extension_sha256": "6361d5167cf9cbcdb3e95d5da2bc15716de6f9333b06cfff745c336a9450ffc1",
+  "platform": "Darwin arm64",
+  "numpy": "2.5.3",
+  "parameters": {
+    "peak_threshold": 1e-05,
+    "edge_threshold": 10,
+    "target_num_features": 4000
+  },
+  "cases": [
+    {
+      "name": "texture-32x32",
+      "width": 32,
+      "height": 32,
+      "features": 4,
+      "input_sha256": "45af0107293c087b524c0b59b09027465b2f141d8d43a23cc7e2e973b7a54ad6",
+      "frames_sha256": "49dd91d7037a864bd24cc1a4d618f6602d9b28fee3cd5ec457ca71b289c5c598",
+      "descriptors_sha256": "243095015aac9ebb841229c6738c69b80385e881154be8816d66e4e0db84721c"
+    },
+    {
+      "name": "texture-65x63",
+      "width": 65,
+      "height": 63,
+      "features": 23,
+      "input_sha256": "a776088b7797cdcb1a32707354dc91f8eba59e68112d17d502e54ab5f05c0f9a",
+      "frames_sha256": "ac4077da0966b069d137902be249401e7e38926cd45c5fc9f05606b060e0a7a1",
+      "descriptors_sha256": "5261f70b1921a10267e338f043181edecec280f2d2442538e4fd9a082fb8b7e5"
+    },
+    {
+      "name": "border-blobs",
+      "width": 129,
+      "height": 97,
+      "features": 6,
+      "input_sha256": "3956bc47e3f8edf451379a577f29ebfe7e82598642aa6b343906e5a4e5470cb9",
+      "frames_sha256": "94a76c8538be71018d93ac98b773734c990804db6aec0f8b3e3098079218acae",
+      "descriptors_sha256": "017cb4abf546fbe12ef7d7833e23c698e35f3fad58b24f6e4d30af5697070285"
+    }
+  ]
+}

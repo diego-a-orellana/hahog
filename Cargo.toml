@@ -1,0 +1,14 @@
+[package]
+name = "hahog-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Rust Hessian-and-gradient feature extraction with an OpenCV-compatible image API"
+readme = "README.md"
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+nalgebra = { version = "0.32.1", default-features = false, features = ["std"] }
+num-traits = "0.2.19"
+opencv = { version = "0.98.1", default-features = false, features = ["imgproc", "clang-runtime"] }
+thiserror = "1.0"
