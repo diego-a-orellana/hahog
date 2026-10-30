@@ -23,10 +23,9 @@ pub(crate) fn assign(pyramid: &Pyramid, frame: Frame) -> Vec<[f64; 2]> {
     let (patch, sigma) = patch::sample(pyramid, frame, 20, 9.);
     let delta = (1. - sigma * sigma).max(0.).sqrt() / (9. / 20.);
     let patch = pyramid::gaussian_blur(&patch, delta);
-    let gradients = descriptor::gradients(&patch);
     let mut hist = [0f64; 36];
     let extent = std::f64::consts::TAU / 36.;
-    for (g, &w) in gradients.iter().zip(mask) {
+    for (g, &w) in descriptor::gradients(&patch).zip(mask) {
         let x = g[1] as f64 / extent;
         let bin = x.floor() as usize;
         let r = x - bin as f64;

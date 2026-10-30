@@ -38,24 +38,28 @@ pub(crate) struct Frame {
     pub a22: f32,
 }
 
-/// Select scale extrema and expand their dominant orientations in detector order.
-pub(crate) fn oriented_detections(
-    pyramid: &pyramid::Pyramid,
-) -> impl Iterator<Item = detector::Detection> + '_ {
+/// Select scale extrema using the full-image peak budget before mask filtering.
+pub(crate) fn selected_detections(pyramid: &pyramid::Pyramid) -> Vec<detector::Detection> {
     let mut detections = detector::detect(pyramid);
     selection::select_strongest(&mut detections);
-    detections.into_iter().flat_map(move |detection| {
-        orientation::assign(pyramid, detection.frame)
-            .into_iter()
-            .map(move |angle| detector::Detection {
-                frame: orientation::rotate(detection.frame, angle[0]),
-                ..detection.clone()
-            })
-    })
+    detections
+}
+
+/// Expand one retained center into its dominant orientations in peak order.
+pub(crate) fn orient_detection(
+    pyramid: &pyramid::Pyramid,
+    detection: detector::Detection,
+) -> impl Iterator<Item = detector::Detection> {
+    orientation::assign(pyramid, detection.frame)
+        .into_iter()
+        .map(move |angle| detector::Detection {
+            frame: orientation::rotate(detection.frame, angle[0]),
+            ..detection.clone()
+        })
 }
 
 /// Quantize the RootSIFT-style histogram of an oriented, isotropic frame.
 pub(crate) fn describe_frame(pyramid: &pyramid::Pyramid, frame: Frame) -> [u8; 128] {
     let (patch, _) = patch::sample(pyramid, frame, 15, 7.5);
-    descriptor::quantize(descriptor::describe(&descriptor::gradients(&patch)))
+    descriptor::quantize(descriptor::describe(&patch))
 }

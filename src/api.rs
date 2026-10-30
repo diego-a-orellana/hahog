@@ -1,6 +1,6 @@
 //! OpenCV-shaped API with pixel-coordinate keypoints and quantized histogram descriptors.
 use crate::algorithm::{
-    describe_frame, math, orientation, oriented_detections, pyramid, Frame, Plane,
+    describe_frame, math, orient_detection, orientation, pyramid, selected_detections, Frame, Plane,
 };
 use crate::{Error, Result};
 use opencv::{core, imgproc, prelude::*};
@@ -43,8 +43,11 @@ impl Hahog {
         let mut points = core::Vector::new();
         if !image.empty() {
             let pyramid = pyramid::Pyramid::build(&image_plane(&image)?);
-            for detection in oriented_detections(&pyramid) {
-                if mask_selects_center(&mask, detection.frame, image.cols(), image.rows())? {
+            for detection in selected_detections(&pyramid) {
+                if !mask_selects_center(&mask, detection.frame, image.cols(), image.rows())? {
+                    continue;
+                }
+                for detection in orient_detection(&pyramid, detection) {
                     points.push(keypoint_from_frame(
                         detection.frame,
                         detection.peak,
@@ -153,7 +156,7 @@ fn compute_detected(image: &core::Mat, mask: &impl core::ToInputArray) -> Result
     let pyramid = pyramid::Pyramid::build(&plane);
     let mut points = core::Vector::new();
     let mut rows = Vec::new();
-    for detection in oriented_detections(&pyramid) {
+    for detection in selected_detections(&pyramid) {
         if !mask_selects_center(
             &mask,
             detection.frame,
@@ -162,12 +165,14 @@ fn compute_detected(image: &core::Mat, mask: &impl core::ToInputArray) -> Result
         )? {
             continue;
         }
-        points.push(keypoint_from_frame(
-            detection.frame,
-            detection.peak,
-            detection.octave,
-        )?);
-        rows.push(describe_frame(&pyramid, detection.frame));
+        for detection in orient_detection(&pyramid, detection) {
+            points.push(keypoint_from_frame(
+                detection.frame,
+                detection.peak,
+                detection.octave,
+            )?);
+            rows.push(describe_frame(&pyramid, detection.frame));
+        }
     }
     Ok((points, rows))
 }

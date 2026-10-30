@@ -16,42 +16,38 @@ struct SpatialBins {
     y_weights: [f32; 2],
 }
 
-/// Return row-major [magnitude, radians] pairs using one-sided border differences.
-pub(super) fn gradients(plane: &Plane) -> Vec<[f32; 2]> {
+/// Yield row-major [magnitude, radians] pairs using one-sided border differences.
+pub(super) fn gradients(plane: &Plane) -> impl Iterator<Item = [f32; 2]> + '_ {
     let w = plane.width;
     let h = plane.height;
-    let at = |x, y| plane.values[y * w + x];
-    (0..h)
-        .flat_map(|y| {
-            (0..w).map(move |x| {
-                let gx = if x == 0 {
-                    at(1, y) - at(0, y)
-                } else if x + 1 == w {
-                    at(x, y) - at(x - 1, y)
-                } else {
-                    ((at(x + 1, y) - at(x - 1, y)) as f64 * 0.5) as f32
-                };
-                let gy = if y == 0 {
-                    at(x, 1) - at(x, 0)
-                } else if y + 1 == h {
-                    at(x, y) - at(x, y - 1)
-                } else {
-                    ((at(x, y + 1) - at(x, y - 1)) as f64 * 0.5) as f32
-                };
-                [
-                    math::vlfeat_sqrt(math::squared_norm2_fma(gx, gy)),
-                    math::mod_tau(
-                        (math::vlfeat_atan2(gy, gx) as f64 + std::f64::consts::TAU) as f32,
-                    ),
-                ]
-            })
+    let at = move |x, y| plane.values[y * w + x];
+    (0..h).flat_map(move |y| {
+        (0..w).map(move |x| {
+            let gx = if x == 0 {
+                at(1, y) - at(0, y)
+            } else if x + 1 == w {
+                at(x, y) - at(x - 1, y)
+            } else {
+                ((at(x + 1, y) - at(x - 1, y)) as f64 * 0.5) as f32
+            };
+            let gy = if y == 0 {
+                at(x, 1) - at(x, 0)
+            } else if y + 1 == h {
+                at(x, y) - at(x, y - 1)
+            } else {
+                ((at(x, y + 1) - at(x, y - 1)) as f64 * 0.5) as f32
+            };
+            [
+                math::vlfeat_sqrt(math::squared_norm2_fma(gx, gy)),
+                math::mod_tau((math::vlfeat_atan2(gy, gx) as f64 + std::f64::consts::TAU) as f32),
+            ]
         })
-        .collect()
+    })
 }
 
 /// Describe a 31×31 canonical patch with scale 2 and orientation pi/2.
-pub(super) fn describe(g: &[[f32; 2]]) -> [f32; 128] {
-    assert_eq!(g.len(), 961);
+pub(super) fn describe(patch: &Plane) -> [f32; 128] {
+    assert_eq!((patch.width, patch.height), (31, 31));
     let mut d = [0f32; 128];
     let angle0 = std::f64::consts::FRAC_PI_2;
     // Keep factors separate: combining them changes single-precision rounding.
@@ -81,7 +77,7 @@ pub(super) fn describe(g: &[[f32; 2]]) -> [f32; 128] {
             }
         })
     });
-    for (&[modulus, angle], spatial) in g.iter().zip(spatial_bins) {
+    for ([modulus, angle], spatial) in gradients(patch).zip(spatial_bins) {
         let theta = math::mod_tau((angle as f64 - angle0) as f32);
         let nt = (8. * theta as f64 / std::f64::consts::TAU) as f32;
         let bt = nt.floor() as i32;

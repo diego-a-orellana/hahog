@@ -57,7 +57,10 @@ fn opencv_rows_use_pixel_centers_diameters_angles_and_l2_descriptors() {
     let image = texture(128, 128);
     let (points, descriptors) = detect(&image, &core::no_array());
     let pyramid = pyramid::Pyramid::build(&image_plane(&image).unwrap());
-    let rows: Vec<_> = oriented_detections(&pyramid).collect();
+    let rows: Vec<_> = selected_detections(&pyramid)
+        .into_iter()
+        .flat_map(|detection| orient_detection(&pyramid, detection))
+        .collect();
     assert!(!rows.is_empty());
     assert_eq!(points.len(), rows.len());
     assert_eq!(descriptors.rows() as usize, points.len());
