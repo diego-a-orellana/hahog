@@ -1,4 +1,10 @@
-# hahog
+```
+▗▖ ▗▖ ▗▄▖ ▗▖ ▗▖ ▗▄▖  ▗▄▄▖
+▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▐▌   
+▐▛▀▜▌▐▛▀▜▌▐▛▀▜▌▐▌ ▐▌▐▌▝▜▌
+▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▝▚▄▞▘▝▚▄▞▘
+                v1.0.0 🐖         
+```
 
 Hessian-and-gradient feature extraction for OpenCV images.
 
