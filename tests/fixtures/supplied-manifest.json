@@ -1,0 +1,17 @@
+{
+  "reference": "OpenSfM native VLFeat exports; patch/gradient/SIFT sequence from hahog.cc",
+  "upstream_revision": "c4985ced723888d2529f9b7a1902d4aa682de1d0",
+  "extension_sha256": "6361d5167cf9cbcdb3e95d5da2bc15716de6f9333b06cfff745c336a9450ffc1",
+  "platform": "Darwin arm64",
+  "numpy": "2.5.3",
+  "width": 65,
+  "height": 63,
+  "inputs": 7,
+  "features": 9,
+  "input_sha256": "a776088b7797cdcb1a32707354dc91f8eba59e68112d17d502e54ab5f05c0f9a",
+  "sha256": {
+    "supplied-texture-input.csv": "8024eb6cbbcbe01034d8e759bee778b19d503751ddcf0bf3ebfa7bdc83518495",
+    "supplied-texture.csv": "9fa8a8c1f38e81a214a7582d306046b2535959865b80a148de7bb3b59385a544",
+    "supplied-texture.bin": "c52027fa63b06fe5716d49d1a35c21a460ac345858199944755f94842740435c"
+  }
+}
