@@ -1,14 +1,36 @@
 [package]
-name = "hahog-rust"
-version = "0.1.0"
+name = "hahog"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.87"
 description = "Rust Hessian-and-gradient feature extraction with an OpenCV-compatible image API"
+documentation = "https://docs.rs/hahog"
+repository = "https://github.com/diego-a-orellana/hahog"
 readme = "README.md"
 license = "BSD-3-Clause"
-publish = false
+keywords = ["hahog", "sift", "opencv", "computer-vision", "feature-detection"]
+include = [
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/tests/fixtures/*.bin",
+    "/tests/fixtures/*.csv",
+    "/tests/fixtures/*.json",
+    "/tests/fixtures/*.md",
+    "/tests/fixtures/*.py",
+    "/benches/*.rs",
+    "/licenses/*.txt",
+    "/licenses/README.md",
+    "/LICENSE",
+    "/README.md",
+    "/CONTRIBUTING.md",
+]
 
 [dependencies]
 nalgebra = { version = "0.32.1", default-features = false, features = ["std"] }
 num-traits = "0.2.19"
 opencv = { version = "0.98.1", default-features = false, features = ["imgproc", "clang-runtime"] }
 thiserror = "1.0"
+
+[[bench]]
+name = "synthetic"
+harness = false

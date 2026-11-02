@@ -59,7 +59,7 @@ pub(crate) fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
             }
         }
         let divisor = m[pivot][j];
-        if divisor.abs() < 1e-10 || divisor == 0. || !divisor.is_finite() {
+        if divisor.abs() < 1e-10 || !divisor.is_finite() {
             return None;
         }
         m.swap(pivot, j);
@@ -105,22 +105,22 @@ pub(crate) fn normalize(d: &mut [f32]) {
     }
 }
 
-/// Build symmetric Gaussian weights with the reference mixed-precision mass sum.
-pub(crate) fn gaussian_kernel(sigma: f64) -> Vec<f32> {
+/// Write symmetric Gaussian weights using the reference mixed-precision mass sum.
+pub(super) fn gaussian_kernel(sigma: f64, kernel: &mut Vec<f32>) {
     let r = (3. * sigma).ceil() as usize;
-    let mut k = vec![1.; 2 * r + 1];
+    kernel.resize(2 * r + 1, 0.);
+    kernel[r] = 1.;
     let mut mass = 1f32;
     for i in 1..=r {
         let x = i as f64 / sigma;
         let g = (-0.5 * x * x).exp();
         mass = (mass as f64 + (g + g)) as f32;
-        k[r - i] = g as f32;
-        k[r + i] = g as f32;
+        kernel[r - i] = g as f32;
+        kernel[r + i] = g as f32;
     }
-    for v in &mut k {
+    for v in kernel {
         *v /= mass;
     }
-    k
 }
 
 /// Multiply a row-major matrix by a planar rotation using nalgebra's two-term product.

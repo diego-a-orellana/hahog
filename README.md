@@ -1,52 +1,80 @@
-# hahog-rust
+# hahog
 
-HAHOG (Hessian-and-gradient) feature extraction in Rust, with OpenCV image and
-keypoint types and SIFT-style calling conventions. Ported from OpenSfM/VLFeat.
+Hessian-and-gradient feature extraction for OpenCV images.
 
-## Setup
-
-Requires native OpenCV, Clang and a C++ toolchain for the `opencv` bindings.
-
-```toml
-[dependencies]
-hahog-rust = { path = "../hahog-rust" }
-opencv = { version = "0.98.1", default-features = false, features = ["imgproc", "clang-runtime"] }
-```
+HAHOG detects distinctive image points and describes their local appearance for
+feature matching. This Rust port of OpenSfM/VLFeat uses OpenCV's `Mat` and
+`KeyPoint` types with SIFT-style calling conventions. It returns oriented
+keypoints and 128-byte RootSIFT-style descriptors.
 
 ## Usage
 
-```rust
-use hahog_rust::Hahog;
-use opencv::core;
+Requires Rust 1.87+, native OpenCV, Clang and a C++ toolchain for the `opencv` bindings.
 
-# fn extract(image: &core::Mat) -> hahog_rust::Result<()> {
-let mut detector = Hahog::new();
-let mut keypoints = core::Vector::<core::KeyPoint>::new();
-let mut descriptors = core::Mat::default();
-detector.detect_and_compute_def(
-    image,
-    &core::no_array(),
-    &mut keypoints,
-    &mut descriptors,
-)?;
-# Ok(())
-# }
+Add both crates to your dependencies:
+
+```toml
+[dependencies]
+hahog = "1.0.0"
+opencv = { version = "0.98.1", default-features = false, features = ["imgproc", "clang-runtime"] }
 ```
 
-- Accepts 8-bit grayscale, BGR or BGRA images at least 32 × 32 pixels, including
-  strided ROIs. Empty images clear outputs; featureless images yield no detections.
-- Returns pixel-coordinate keypoints and 128-byte RootSIFT-style descriptor rows
-  (`CV_8UC1`). Match descriptors with **L2 distance**.
-- Optional masks are `CV_8UC1`, match the image size, and select centers at nonzero pixels.
-- Detection uses fixed thresholds and keeps up to 4000 detections before
-  orientation expansion, so the final keypoint count can be larger.
+Extract features from an existing image:
 
-Use `detect` for keypoints only and `compute` for supplied keypoints. Combined
-extraction preserves more frame precision than separate calls. `Hahog` follows
+```rust
+use hahog::{Hahog, Result};
+use opencv::core;
+
+fn extract(image: &core::Mat) -> Result<(core::Vector<core::KeyPoint>, core::Mat)> {
+    let mut detector = Hahog::new();
+    let mut keypoints = core::Vector::<core::KeyPoint>::new();
+    let mut descriptors = core::Mat::default();
+
+    detector.detect_and_compute_def(
+        image,
+        &core::no_array(),
+        &mut keypoints,
+        &mut descriptors,
+    )?;
+
+    Ok((keypoints, descriptors))
+}
+```
+
+Descriptor row `i` belongs to keypoint `i`. Match descriptors with **L2 distance**.
+Replace `core::no_array()` with a mask to select keypoint centers.
+
+## Inputs and outputs
+
+| Value | Contract |
+| --- | --- |
+| Image | 8-bit grayscale, BGR or BGRA; at least 32 × 32 pixels. Strided ROIs are supported. |
+| Mask | Optional `CV_8UC1` matrix matching the image size; nonzero pixels select centers. |
+| Keypoints | Original-image pixel coordinates, diameters in pixels and clockwise angles in degrees. |
+| Descriptors | One 128-byte row per keypoint, stored as `CV_8UC1`. |
+
+Detection uses fixed thresholds and keeps up to 4000 detections before orientation
+assignment. A center can have multiple orientations, so the final keypoint count
+can be larger. Masks filter centers after this global budget is applied;
+orientation and descriptor patches may sample outside the selected region.
+
+Use `detect` for keypoints only and `compute` to describe supplied keypoints.
+Supplied angles of `-1` trigger orientation assignment, which can add keypoints or
+remove flat patches. Response, octave and class ID are retained. Combined
+extraction preserves more frame precision than separate detection and computation.
+
+Empty images clear outputs after mask validation; featureless images yield no
+detections. In supplied-keypoint mode, the mask is ignored. `Hahog` follows
 OpenCV's method conventions but does not implement C++ `Feature2D` inheritance.
-Run `cargo doc --open` for the complete API contract.
+See the [API documentation](https://docs.rs/hahog) for the full contract.
+
+## Development
+
+See [CONTRIBUTING.md](https://github.com/diego-a-orellana/hahog/blob/release/1.0.0/CONTRIBUTING.md)
+for checks, benchmarks and reference fixtures.
 
 ## License
 
-BSD-3-Clause; adapted portions retain their upstream BSD terms.
-See [attribution and license notices](licenses/README.md).
+BSD-3-Clause. See [LICENSE](https://github.com/diego-a-orellana/hahog/blob/release/1.0.0/LICENSE).
+Adapted portions retain their upstream BSD terms; see
+[attribution and license notices](https://github.com/diego-a-orellana/hahog/blob/release/1.0.0/licenses/README.md).

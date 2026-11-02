@@ -191,4 +191,49 @@ mod tests {
         let actual: Vec<_> = rows.iter().map(|row| row.frame.x as usize).collect();
         assert_eq!(actual, [3, 10, 6, 0, 2, 4, 7, 9, 8, 5, 1]);
     }
+
+    /// Both cap boundaries must retain the independently recorded native tie permutation.
+    #[test]
+    fn capped_ties_match_native_reference_ids() {
+        for (count, expected) in [
+            (
+                4001,
+                include_bytes!("../../tests/fixtures/selection-ties-4001.bin"),
+            ),
+            (
+                6000,
+                include_bytes!("../../tests/fixtures/selection-ties-6000.bin"),
+            ),
+            (
+                6001,
+                include_bytes!("../../tests/fixtures/selection-ties-6001.bin"),
+            ),
+        ] {
+            let mut detections: Vec<_> = (0..count)
+                .map(|id| Detection {
+                    frame: super::super::Frame {
+                        x: id as f32,
+                        y: 0.,
+                        a11: 1.,
+                        a12: 0.,
+                        a21: 0.,
+                        a22: 1.,
+                    },
+                    octave: 0,
+                    peak: ((id * 37 + 11) % 17) as f32 - 8. + 0.25,
+                })
+                .collect();
+            select_strongest(&mut detections);
+            assert_eq!(detections.len() * 4, expected.len());
+            for (index, (detection, bytes)) in
+                detections.iter().zip(expected.chunks_exact(4)).enumerate()
+            {
+                let expected_id = u32::from_le_bytes(bytes.try_into().unwrap());
+                assert_eq!(
+                    detection.frame.x as u32, expected_id,
+                    "input count {count}, feature {index}"
+                );
+            }
+        }
+    }
 }

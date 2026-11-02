@@ -10,8 +10,12 @@ mod patch;
 pub(crate) mod pyramid;
 mod selection;
 
+pub(crate) use descriptor::DESCRIPTOR_LEN;
+pub(crate) use detector::Detection;
+
 /// Dense row-major pixels; input intensities are normalized to [0, 1].
-#[derive(Clone, Debug)]
+/// The default is empty scratch storage; pixel kernels require initialized dimensions.
+#[derive(Debug, Default)]
 pub(crate) struct Plane {
     /// Number of columns.
     pub width: usize,
@@ -19,6 +23,40 @@ pub(crate) struct Plane {
     pub height: usize,
     /// Exactly `width * height` pixels, without row padding.
     pub values: Vec<f32>,
+}
+
+impl Plane {
+    /// Take ownership of dense pixels, checking their dimensions once at construction.
+    pub(crate) fn from_values(width: usize, height: usize, values: Vec<f32>) -> Self {
+        assert_eq!(width.checked_mul(height), Some(values.len()));
+        Self {
+            width,
+            height,
+            values,
+        }
+    }
+
+    /// Set dimensions and zero every pixel while retaining the existing allocation.
+    pub(super) fn reset(&mut self, width: usize, height: usize) {
+        let length = width
+            .checked_mul(height)
+            .expect("plane dimensions overflow");
+        self.values.clear();
+        self.values.resize(length, 0.);
+        self.width = width;
+        self.height = height;
+    }
+}
+
+/// Buffers reused across orientation and descriptor patches within one extraction.
+#[derive(Default)]
+pub(crate) struct PatchWorkspace {
+    /// Canonical pixels sampled at the current frame.
+    patch: Plane,
+    /// Smoothed orientation pixels; descriptor patches need no additional blur.
+    smoothed: Plane,
+    /// Intermediate convolution pixels and kernel coefficients.
+    blur: pyramid::GaussianBlur,
 }
 
 /// Pixel center and row-major affine basis, before API-specific scale and angle conversion.
@@ -49,17 +87,26 @@ pub(crate) fn selected_detections(pyramid: &pyramid::Pyramid) -> Vec<detector::D
 pub(crate) fn orient_detection(
     pyramid: &pyramid::Pyramid,
     detection: detector::Detection,
+    workspace: &mut PatchWorkspace,
 ) -> impl Iterator<Item = detector::Detection> {
-    orientation::assign(pyramid, detection.frame)
-        .into_iter()
-        .map(move |angle| detector::Detection {
-            frame: orientation::rotate(detection.frame, angle[0]),
-            ..detection.clone()
-        })
+    orientation::assign(pyramid, detection.frame, workspace).map(move |angle| detector::Detection {
+        frame: orientation::rotate(detection.frame, angle),
+        ..detection
+    })
 }
 
 /// Quantize the RootSIFT-style histogram of an oriented, isotropic frame.
-pub(crate) fn describe_frame(pyramid: &pyramid::Pyramid, frame: Frame) -> [u8; 128] {
-    let (patch, _) = patch::sample(pyramid, frame, 15, 7.5);
-    descriptor::quantize(descriptor::describe(&patch))
+pub(crate) fn describe_frame(
+    pyramid: &pyramid::Pyramid,
+    frame: Frame,
+    workspace: &mut PatchWorkspace,
+) -> [u8; DESCRIPTOR_LEN] {
+    patch::sample(
+        pyramid,
+        frame,
+        descriptor::PATCH_RADIUS,
+        descriptor::PATCH_EXTENT,
+        &mut workspace.patch,
+    );
+    descriptor::quantize(descriptor::describe(&workspace.patch))
 }

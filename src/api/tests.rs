@@ -57,9 +57,10 @@ fn opencv_rows_use_pixel_centers_diameters_angles_and_l2_descriptors() {
     let image = texture(128, 128);
     let (points, descriptors) = detect(&image, &core::no_array());
     let pyramid = pyramid::Pyramid::build(&image_plane(&image).unwrap());
+    let mut workspace = PatchWorkspace::default();
     let rows: Vec<_> = selected_detections(&pyramid)
         .into_iter()
-        .flat_map(|detection| orient_detection(&pyramid, detection))
+        .flat_map(|detection| orient_detection(&pyramid, detection, &mut workspace))
         .collect();
     assert!(!rows.is_empty());
     assert_eq!(points.len(), rows.len());
@@ -80,7 +81,7 @@ fn opencv_rows_use_pixel_centers_diameters_angles_and_l2_descriptors() {
                 .unwrap()
                 .data_typed::<u8>()
                 .unwrap(),
-            describe_frame(&pyramid, row.frame)
+            describe_frame(&pyramid, row.frame, &mut workspace)
         );
     }
     assert_eq!(Hahog::new().default_norm(), core::NORM_L2);
@@ -97,7 +98,7 @@ fn image_conversion_validates_dimensions_and_normalizes_pixels() {
         core::Mat::new_rows_cols_with_default(32, 32, core::CV_32FC1, core::Scalar::all(0.))
             .unwrap(),
     ] {
-        assert!(image_plane(&image).is_err());
+        assert!(validate_image(&image).is_err());
     }
     let blank = core::Mat::new_rows_cols_with_default(32, 32, core::CV_8UC1, core::Scalar::all(0.))
         .unwrap();
@@ -215,6 +216,268 @@ fn empty_and_featureless_images_clear_prior_outputs() {
     }
 }
 
+/// Invalid nonempty masks must win over empty-image clearing in both detection APIs.
+#[test]
+fn empty_images_validate_nonempty_masks_before_clearing_outputs() {
+    let image = core::Mat::default();
+    for (mask_type, expected) in [
+        (
+            core::CV_32FC1,
+            Error::MaskType {
+                actual: core::CV_32FC1,
+            },
+        ),
+        (
+            core::CV_8UC1,
+            Error::MaskShape {
+                dimensions: 2,
+                width: 32,
+                height: 32,
+                image_width: 0,
+                image_height: 0,
+            },
+        ),
+    ] {
+        let mask = core::Mat::new_rows_cols_with_default(32, 32, mask_type, core::Scalar::all(0.))
+            .unwrap();
+        let original =
+            core::Vector::from_iter([
+                core::KeyPoint::new_coords(10., 10., 3., 123., 0.25, 7, 42).unwrap()
+            ]);
+        let mut points = original.clone();
+        let error = Hahog::new().detect(&image, &mut points, &mask).unwrap_err();
+        assert_eq!(error.to_string(), expected.to_string());
+        same_points(&points, &original);
+
+        let mut descriptors = core::Mat::from_slice_2d(&[[13u8; 128]]).unwrap();
+        let error = Hahog::new()
+            .detect_and_compute_def(&image, &mask, &mut points, &mut descriptors)
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected.to_string());
+        same_points(&points, &original);
+        assert_eq!(descriptors.data_bytes().unwrap(), [13u8; 128]);
+    }
+}
+
+/// A zero mask ROI must clear stale outputs even when surrounding pixels are selected.
+#[test]
+fn zero_mask_shortcuts_clear_outputs_with_a_strided_mask() {
+    let image = texture(64, 64);
+    let mut storage =
+        core::Mat::new_rows_cols_with_default(66, 66, core::CV_8UC1, core::Scalar::all(255.))
+            .unwrap();
+    for y in 1..65 {
+        for x in 1..65 {
+            *storage.at_2d_mut::<u8>(y, x).unwrap() = 0;
+        }
+    }
+    let mask = core::Mat::roi(&storage, core::Rect::new(1, 1, 64, 64)).unwrap();
+    assert!(!mask.is_continuous());
+    let original = core::Vector::from_iter([core::KeyPoint::new_coords_def(10., 10., 3.).unwrap()]);
+    let mut points = original.clone();
+    Hahog::new().detect(&image, &mut points, &mask).unwrap();
+    assert!(points.is_empty());
+
+    points = original;
+    let mut descriptors = core::Mat::from_slice_2d(&[[13u8; 128]]).unwrap();
+    Hahog::new()
+        .detect_and_compute_def(&image, &mask, &mut points, &mut descriptors)
+        .unwrap();
+    assert!(points.is_empty());
+    assert!(descriptors.empty());
+}
+
+/// Zero-valued masks must not bypass validation or change mask-before-image precedence.
+#[test]
+fn zero_mask_shortcuts_preserve_validation_and_outputs() {
+    for (width, height, image_type, mask_width, mask_type, expected) in [
+        (
+            64,
+            64,
+            core::CV_32FC1,
+            64,
+            core::CV_8UC1,
+            Error::ImageType {
+                actual: core::CV_32FC1,
+            },
+        ),
+        (
+            16,
+            32,
+            core::CV_32FC1,
+            16,
+            core::CV_8UC1,
+            Error::ImageShape {
+                dimensions: 2,
+                width: 16,
+                height: 32,
+            },
+        ),
+        (
+            64,
+            64,
+            core::CV_32FC1,
+            32,
+            core::CV_8UC1,
+            Error::MaskShape {
+                dimensions: 2,
+                width: 32,
+                height: 64,
+                image_width: 64,
+                image_height: 64,
+            },
+        ),
+        (
+            16,
+            32,
+            core::CV_32FC1,
+            64,
+            core::CV_32FC1,
+            Error::MaskType {
+                actual: core::CV_32FC1,
+            },
+        ),
+    ] {
+        let image =
+            core::Mat::new_rows_cols_with_default(height, width, image_type, core::Scalar::all(0.))
+                .unwrap();
+        let mask = core::Mat::new_rows_cols_with_default(
+            height,
+            mask_width,
+            mask_type,
+            core::Scalar::all(0.),
+        )
+        .unwrap();
+        let original =
+            core::Vector::from_iter([core::KeyPoint::new_coords_def(10., 10., 3.).unwrap()]);
+        let mut points = original.clone();
+        let mut descriptors = core::Mat::from_slice_2d(&[[13u8; 128]]).unwrap();
+        let error = Hahog::new().detect(&image, &mut points, &mask).unwrap_err();
+        assert_eq!(error.to_string(), expected.to_string());
+        same_points(&points, &original);
+        let error = Hahog::new()
+            .detect_and_compute_def(&image, &mask, &mut points, &mut descriptors)
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected.to_string());
+        same_points(&points, &original);
+        assert_eq!(descriptors.data_bytes().unwrap(), [13u8; 128]);
+    }
+}
+
+/// Empty supplied frames still validate images, ignore masks and clear old descriptors.
+#[test]
+fn empty_provided_keypoints_validate_images_and_clear_descriptors() {
+    let irrelevant_mask =
+        core::Mat::new_rows_cols_with_default(1, 1, core::CV_32FC1, core::Scalar::all(0.)).unwrap();
+    let mut points = core::Vector::new();
+    for image in [
+        core::Mat::default(),
+        texture(64, 64),
+        core::Mat::new_rows_cols_with_default(64, 64, core::CV_8UC3, core::Scalar::all(127.))
+            .unwrap(),
+        core::Mat::new_rows_cols_with_default(64, 64, core::CV_8UC4, core::Scalar::all(127.))
+            .unwrap(),
+    ] {
+        let mut descriptors = core::Mat::from_slice_2d(&[[13u8; 128]]).unwrap();
+        Hahog::new()
+            .detect_and_compute(
+                &image,
+                &irrelevant_mask,
+                &mut points,
+                &mut descriptors,
+                true,
+            )
+            .unwrap();
+        assert!(points.is_empty());
+        assert!(descriptors.empty());
+    }
+    for (width, expected) in [
+        (
+            16,
+            Error::ImageShape {
+                dimensions: 2,
+                width: 16,
+                height: 64,
+            },
+        ),
+        (
+            64,
+            Error::ImageType {
+                actual: core::CV_32FC1,
+            },
+        ),
+    ] {
+        let image =
+            core::Mat::new_rows_cols_with_default(64, width, core::CV_32FC1, core::Scalar::all(0.))
+                .unwrap();
+        let mut descriptors = core::Mat::from_slice_2d(&[[13u8; 128]]).unwrap();
+        let error = Hahog::new()
+            .detect_and_compute(
+                &image,
+                &irrelevant_mask,
+                &mut points,
+                &mut descriptors,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected.to_string());
+        assert!(points.is_empty());
+        assert_eq!(descriptors.data_bytes().unwrap(), [13u8; 128]);
+    }
+}
+
+/// Borrowed descriptor rows must copy into strided outputs before committing keypoints.
+#[test]
+fn descriptor_copy_supports_strided_output_and_preserves_points_on_failure() {
+    let image = texture(64, 64);
+    let original = core::Vector::from_iter([
+        core::KeyPoint::new_coords(32., 32., 8., -1., 0.25, 7, 42).unwrap(),
+        core::KeyPoint::new_coords(40., 36., 6., 123., 0.5, 3, 19).unwrap(),
+    ]);
+    let mut expected = original.clone();
+    let mut descriptors = core::Mat::default();
+    Hahog::new()
+        .compute(&image, &mut expected, &mut descriptors)
+        .unwrap();
+    assert!(expected.len() >= 2);
+    let mut storage = core::Mat::new_rows_cols_with_default(
+        descriptors.rows() + 2,
+        132,
+        core::CV_8UC1,
+        core::Scalar::all(165.),
+    )
+    .unwrap();
+    let mut points = original.clone();
+    {
+        let mut output =
+            core::Mat::roi_mut(&mut storage, core::Rect::new(2, 1, 128, descriptors.rows()))
+                .unwrap();
+        assert!(!output.is_continuous());
+        Hahog::new()
+            .compute(&image, &mut points, &mut output)
+            .unwrap();
+        same_points(&points, &expected);
+        for row in 0..descriptors.rows() {
+            assert_eq!(
+                output.row(row).unwrap().data_bytes().unwrap(),
+                descriptors.row(row).unwrap().data_bytes().unwrap(),
+            );
+        }
+    }
+    for y in 0..storage.rows() {
+        for x in 0..storage.cols() {
+            if y == 0 || y == storage.rows() - 1 || !(2..130).contains(&x) {
+                assert_eq!(*storage.at_2d::<u8>(y, x).unwrap(), 165);
+            }
+        }
+    }
+    points = original.clone();
+    assert!(Hahog::new()
+        .compute(&image, &mut points, &mut core::no_array())
+        .is_err());
+    same_points(&points, &original);
+}
+
 /// Verify explicit and inferred orientations and the provided-keypoint mask contract.
 #[test]
 fn provided_keypoints_preserve_fields_ignore_mask_and_assign_missing_angles() {
@@ -252,7 +515,11 @@ fn provided_keypoints_preserve_fields_ignore_mask_and_assign_missing_angles() {
         a21: 0.,
         a22: 4.,
     };
-    let expected = describe_frame(&pyramid, orientation::rotate(frame, 123f64.to_radians()));
+    let expected = describe_frame(
+        &pyramid,
+        orientation::rotate(frame, 123f64.to_radians()),
+        &mut PatchWorkspace::default(),
+    );
     assert_eq!(descriptors.data_typed::<u8>().unwrap(), expected);
     points = core::Vector::from_iter([
         core::KeyPoint::new_coords(56., 62., 8., -1., 0.25, 7, 42).unwrap()
@@ -264,6 +531,10 @@ fn provided_keypoints_preserve_fields_ignore_mask_and_assign_missing_angles() {
     assert_eq!(descriptors.rows() as usize, points.len());
     for point in points {
         assert!((0. ..360.).contains(&point.angle()));
+        assert_eq!(point.pt(), core::Point2f::new(56., 62.));
+        assert_eq!(point.size(), 8.);
+        assert_eq!(point.response(), 0.25);
+        assert_eq!(point.octave(), 7);
         assert_eq!(point.class_id(), 42);
     }
 }
@@ -373,6 +644,31 @@ fn detection_only_matches_combined_keypoints_and_mask_order() {
         .detect_def(&core::Mat::default(), &mut points)
         .unwrap();
     assert!(points.is_empty());
+}
+
+/// Shared traversal must stage detected points until a generic descriptor output succeeds.
+#[test]
+fn detected_keypoints_are_preserved_when_descriptor_output_fails() {
+    let image = texture(128, 128);
+    let original =
+        core::Vector::from_iter([
+            core::KeyPoint::new_coords(10., 10., 3., 123., 0.25, 7, 42).unwrap()
+        ]);
+    let mut points = original.clone();
+    assert!(Hahog::new()
+        .detect_and_compute_def(
+            &image,
+            &core::no_array(),
+            &mut points,
+            &mut core::no_array()
+        )
+        .is_err());
+    same_points(&points, &original);
+
+    Hahog::new().detect_def(&image, &mut points).unwrap();
+    let (expected, _) = detect(&image, &core::no_array());
+    assert!(!expected.is_empty());
+    same_points(&points, &expected);
 }
 
 /// The compute shorthand must match combined extraction with supplied frames.

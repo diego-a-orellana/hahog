@@ -2,14 +2,30 @@
 use super::{math, Plane};
 use std::sync::OnceLock;
 
+/// Radius of the canonical descriptor patch in samples.
+pub(super) const PATCH_RADIUS: usize = 15;
+/// Half-width of the descriptor patch in canonical frame units.
+pub(super) const PATCH_EXTENT: f64 = 7.5;
+/// Number of samples along either patch axis.
+const PATCH_SIDE: usize = 2 * PATCH_RADIUS + 1;
+/// Number of cached spatial entries, one per patch sample.
+const PATCH_PIXELS: usize = PATCH_SIDE * PATCH_SIDE;
+/// Histogram cells along each spatial axis.
+const SPATIAL_BINS_PER_AXIS: usize = 4;
+/// Orientation bins within each spatial cell.
+const ANGULAR_BINS: usize = 8;
+/// Number of elements in both floating-point and quantized descriptors.
+pub(crate) const DESCRIPTOR_LEN: usize =
+    SPATIAL_BINS_PER_AXIS * SPATIAL_BINS_PER_AXIS * ANGULAR_BINS;
+/// Sentinel for a spatial destination outside the descriptor's 128 bins.
+const INVALID_BASE: u8 = u8::MAX;
+
 /// Image-independent spatial contributions to the descriptor's trilinear histogram.
 struct SpatialBins {
     /// Gaussian window weight at this canonical patch pixel.
     window: f32,
-    /// Lower horizontal histogram bin, relative to the patch center.
-    x: i32,
-    /// Lower vertical histogram bin, relative to the patch center.
-    y: i32,
+    /// Angular-bin base for each `[horizontal][vertical]` destination, or `INVALID_BASE`.
+    bases: [[u8; 2]; 2],
     /// Contributions to the lower and upper horizontal bins.
     x_weights: [f32; 2],
     /// Contributions to the lower and upper vertical bins.
@@ -46,23 +62,23 @@ pub(super) fn gradients(plane: &Plane) -> impl Iterator<Item = [f32; 2]> + '_ {
 }
 
 /// Describe a 31×31 canonical patch with scale 2 and orientation pi/2.
-pub(super) fn describe(patch: &Plane) -> [f32; 128] {
-    assert_eq!((patch.width, patch.height), (31, 31));
-    let mut d = [0f32; 128];
+pub(super) fn describe(patch: &Plane) -> [f32; DESCRIPTOR_LEN] {
+    assert_eq!((patch.width, patch.height), (PATCH_SIDE, PATCH_SIDE));
+    let mut d = [0f32; DESCRIPTOR_LEN];
     let angle0 = std::f64::consts::FRAC_PI_2;
     // Keep factors separate: combining them changes single-precision rounding.
-    static SPATIAL_BINS: OnceLock<[SpatialBins; 961]> = OnceLock::new();
+    static SPATIAL_BINS: OnceLock<[SpatialBins; PATCH_PIXELS]> = OnceLock::new();
     let spatial_bins = SPATIAL_BINS.get_or_init(|| {
         let st = angle0.sin();
         let ct = angle0.cos();
-        let sbp = 6. + f64::EPSILON;
+        let spatial_bin_size = 6. + f64::EPSILON;
         std::array::from_fn(|i| {
-            let x = i % 31;
-            let y = i / 31;
-            let dx = x as f32 - 15.;
-            let dy = y as f32 - 15.;
-            let nx = ((ct.mul_add(dx as f64, st * dy as f64)) / sbp) as f32;
-            let ny = (((-st).mul_add(dx as f64, ct * dy as f64)) / sbp) as f32;
+            let x = i % PATCH_SIDE;
+            let y = i / PATCH_SIDE;
+            let dx = x as f32 - PATCH_RADIUS as f32;
+            let dy = y as f32 - PATCH_RADIUS as f32;
+            let nx = ((ct.mul_add(dx as f64, st * dy as f64)) / spatial_bin_size) as f32;
+            let ny = (((-st).mul_add(dx as f64, ct * dy as f64)) / spatial_bin_size) as f32;
             let win = math::vlfeat_exp_neg((math::squared_norm2_fma(nx, ny)) as f64 / 8.) as f32;
             let bx = (nx as f64 - 0.5).floor() as i32;
             let by = (ny as f64 - 0.5).floor() as i32;
@@ -70,8 +86,20 @@ pub(super) fn describe(patch: &Plane) -> [f32; 128] {
             let ry = (ny as f64 - (by as f64 + 0.5)) as f32;
             SpatialBins {
                 window: win,
-                x: bx,
-                y: by,
+                bases: std::array::from_fn(|ix| {
+                    std::array::from_fn(|iy| {
+                        let bin_x = bx + ix as i32 + (SPATIAL_BINS_PER_AXIS / 2) as i32;
+                        let bin_y = by + iy as i32 + (SPATIAL_BINS_PER_AXIS / 2) as i32;
+                        if (0..SPATIAL_BINS_PER_AXIS as i32).contains(&bin_x)
+                            && (0..SPATIAL_BINS_PER_AXIS as i32).contains(&bin_y)
+                        {
+                            ((bin_y as usize * SPATIAL_BINS_PER_AXIS + bin_x as usize)
+                                * ANGULAR_BINS) as u8
+                        } else {
+                            INVALID_BASE
+                        }
+                    })
+                }),
                 x_weights: std::array::from_fn(|ix| (1. - ix as f32 - rx).abs()),
                 y_weights: std::array::from_fn(|iy| (1. - iy as f32 - ry).abs()),
             }
@@ -79,19 +107,18 @@ pub(super) fn describe(patch: &Plane) -> [f32; 128] {
     });
     for ([modulus, angle], spatial) in gradients(patch).zip(spatial_bins) {
         let theta = math::mod_tau((angle as f64 - angle0) as f32);
-        let nt = (8. * theta as f64 / std::f64::consts::TAU) as f32;
+        let nt = (ANGULAR_BINS as f64 * theta as f64 / std::f64::consts::TAU) as f32;
         let bt = nt.floor() as i32;
         let rt = nt - bt as f32;
         for (ix, &wx) in spatial.x_weights.iter().enumerate() {
             for (iy, &wy) in spatial.y_weights.iter().enumerate() {
+                let base = spatial.bases[ix][iy];
+                if base == INVALID_BASE {
+                    continue;
+                }
                 for it in 0..2 {
-                    let xx = spatial.x + ix as i32;
-                    let yy = spatial.y + iy as i32;
-                    if (-2..2).contains(&xx) && (-2..2).contains(&yy) {
-                        let weight =
-                            spatial.window * modulus * wx * wy * (1. - it as f32 - rt).abs();
-                        d[((yy + 2) * 32 + (xx + 2) * 8 + (bt + it) % 8) as usize] += weight;
-                    }
+                    let weight = spatial.window * modulus * wx * wy * (1. - it as f32 - rt).abs();
+                    d[base as usize + ((bt + it) % ANGULAR_BINS as i32) as usize] += weight;
                 }
             }
         }
@@ -105,6 +132,6 @@ pub(super) fn describe(patch: &Plane) -> [f32; 128] {
 }
 
 /// Apply the reference square-root transform, scale by 362 and round ties to even.
-pub(super) fn quantize(d: [f32; 128]) -> [u8; 128] {
+pub(super) fn quantize(d: [f32; DESCRIPTOR_LEN]) -> [u8; DESCRIPTOR_LEN] {
     d.map(|v| (362. * v.sqrt()).clamp(0., 255.).round_ties_even() as u8)
 }

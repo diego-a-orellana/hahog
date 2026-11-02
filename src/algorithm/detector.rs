@@ -5,8 +5,15 @@ use super::{
     Frame, Plane,
 };
 
+/// Minimum absolute interpolated Hessian score, in the reference's single precision.
+const PEAK_THRESHOLD: f32 = 1e-5;
+/// Maximum principal-curvature ratio accepted at a localized extremum.
+const EDGE_THRESHOLD: f32 = 10.;
+/// Maximum spatial localization steps; the scale index remains fixed.
+const LOCALIZATION_STEPS: usize = 5;
+
 /// Localized isotropic frame and its scale-normalized Hessian score.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Detection {
     /// Frame in original-image pixels; isotropic until orientation assignment.
     pub frame: Frame,
@@ -17,43 +24,40 @@ pub(crate) struct Detection {
 }
 
 /// Compute scale-normalized Hessian determinants, replicating interior border values.
-pub(crate) fn hessian_response(image: &Plane, o: usize, s: i32) -> Plane {
+fn hessian_response(image: &Plane, octave: usize, subdivision: i32, output: &mut Plane) {
     let w = image.width;
     let h = image.height;
-    let mut values = vec![0.; w * h];
-    let factor = (pyramid::sigma(o, s) / 2f64.powi(o as i32)).powf(4.) as f32;
+    debug_assert!(w >= 3 && h >= 3);
+    debug_assert_eq!(image.values.len(), w * h);
+    output.reset(w, h);
+    let values = &mut output.values;
+    let factor = (pyramid::sigma(octave, subdivision) / 2f64.powi(octave as i32)).powf(4.) as f32;
     for y in 1..h - 1 {
+        let above = &image.values[(y - 1) * w..y * w];
+        let middle = &image.values[y * w..(y + 1) * w];
+        let below = &image.values[(y + 1) * w..(y + 2) * w];
+        let row = &mut values[y * w..(y + 1) * w];
         for x in 1..w - 1 {
-            let at = |dx: isize, dy: isize| {
-                image.values[(y as isize + dy) as usize * w + (x as isize + dx) as usize]
-            };
-            let center = 2. * at(0, 0);
-            let xx = center - at(-1, 0) - at(1, 0);
-            let yy = center - at(0, -1) - at(0, 1);
-            let xy = (at(-1, -1) - at(-1, 1) - at(1, -1) + at(1, 1)) / 4.;
-            values[y * w + x] = math::determinant2([xx, xy, xy, yy]) * factor;
+            let center = 2. * middle[x];
+            let xx = center - middle[x - 1] - middle[x + 1];
+            let yy = center - above[x] - below[x];
+            let xy = (above[x - 1] - below[x - 1] - above[x + 1] + below[x + 1]) / 4.;
+            row[x] = math::determinant2([xx, xy, xy, yy]) * factor;
         }
-    }
-    for y in 1..h - 1 {
-        values[y * w] = values[y * w + 1];
-        values[(y + 1) * w - 1] = values[(y + 1) * w - 2];
+        row[0] = row[1];
+        row[w - 1] = row[w - 2];
     }
     values.copy_within(w..2 * w, 0);
     values.copy_within((h - 2) * w..(h - 1) * w, (h - 1) * w);
-    Plane {
-        width: w,
-        height: h,
-        values,
-    }
 }
 
 /// Localize an extremum in at most five steps; reject weak, singular or edge-like peaks.
 fn refine_extremum(
-    levels: &[Plane],
-    o: usize,
+    levels: &[Plane; 3],
+    octave: usize,
     mut x: usize,
     mut y: usize,
-    z: usize,
+    level_index: usize,
 ) -> Option<Detection> {
     let w = levels[0].width;
     let h = levels[0].height;
@@ -61,9 +65,9 @@ fn refine_extremum(
     let mut grad = [0.; 3];
     let mut a = [[0.; 3]; 3];
     let mut value = 0.;
-    for iteration in 0..5 {
+    for iteration in 0..LOCALIZATION_STEPS {
         let at = |dx: isize, dy: isize, dz: isize| {
-            levels[(z as isize + dz) as usize].values
+            levels[(1 + dz) as usize].values
                 [(y as isize + dy) as usize * w + (x as isize + dx) as usize]
         };
         value = at(0, 0, 0);
@@ -95,7 +99,7 @@ fn refine_extremum(
             break;
         }
         // The fifth iteration's derivatives refer to its current location.
-        if iteration != 4 {
+        if iteration + 1 != LOCALIZATION_STEPS {
             x = (x as isize + dx) as usize;
             y = (y as isize + dy) as usize;
         }
@@ -111,20 +115,28 @@ fn refine_extremum(
     } else {
         ((0.5 * alpha - 1.) + ((0.25 * alpha - 1.).max(0.) * alpha).sqrt()) as f32
     };
-    if delta.iter().any(|v| v.abs() >= 1.5) || peak.abs() <= 1e-5f32 || edge >= 10. {
+    if delta.iter().any(|v| v.abs() >= 1.5)
+        || peak.abs() <= PEAK_THRESHOLD
+        || edge >= EDGE_THRESHOLD
+    {
         return None;
     }
     let xx = (x as f64 + delta[0]) as f32;
     let yy = (y as f64 + delta[1]) as f32;
-    let zz = (z as f64 + delta[2]) as f32;
+    let localized_level = (level_index as f64 + delta[2]) as f32;
     if !(0. ..=w as f32 - 1.).contains(&xx)
         || !(0. ..=h as f32 - 1.).contains(&yy)
-        || !(0. ..=4.).contains(&zz)
+        || !(0. ..=(pyramid::LEVELS_PER_OCTAVE - 1) as f32).contains(&localized_level)
     {
         return None;
     }
-    let scale = (pyramid::base_sigma() * 2f64.powf((o as f32 + (zz - 1.) / 3.) as f64)) as f32;
-    let step = 2f64.powi(o as i32);
+    let scale = (pyramid::base_sigma()
+        * 2f64.powf(
+            (octave as f32
+                + (localized_level + pyramid::FIRST_SUBDIVISION as f32)
+                    / pyramid::SUBDIVISIONS_PER_OCTAVE as f32) as f64,
+        )) as f32;
+    let step = 2f64.powi(octave as i32);
     Some(Detection {
         frame: Frame {
             x: (xx as f64 * step) as f32,
@@ -134,7 +146,7 @@ fn refine_extremum(
             a21: 0.,
             a22: scale,
         },
-        octave: o as i32,
+        octave: octave as i32,
         peak,
     })
 }
@@ -142,48 +154,115 @@ fn refine_extremum(
 /// Detect refined extrema from coarse to fine octaves, preserving scan order.
 pub(crate) fn detect(pyramid: &Pyramid) -> Vec<Detection> {
     let mut detections = Vec::new();
-    for (o, planes) in pyramid.octaves.iter().enumerate().rev() {
-        let responses: Vec<_> = planes
-            .iter()
-            .enumerate()
-            .map(|(s, p)| hessian_response(p, o, s as i32 - 1))
-            .collect();
-        detections.extend(find_extrema(&responses, o));
+    let mut responses = std::array::from_fn(|_| Plane::default());
+    for (octave, planes) in pyramid.octaves.iter().enumerate().rev() {
+        for (index, (image, response)) in planes.iter().zip(&mut responses).enumerate() {
+            hessian_response(
+                image,
+                octave,
+                index as i32 + pyramid::FIRST_SUBDIVISION,
+                response,
+            );
+        }
+        for level_index in 1..pyramid::LEVELS_PER_OCTAVE - 1 {
+            if level_index > 1 {
+                // Only x/y move during localization, so three adjacent scales suffice.
+                responses.rotate_left(1);
+                let next_index = level_index + 1;
+                hessian_response(
+                    &planes[next_index],
+                    octave,
+                    next_index as i32 + pyramid::FIRST_SUBDIVISION,
+                    &mut responses[2],
+                );
+            }
+            append_extrema(&responses, octave, level_index, &mut detections);
+        }
     }
     detections
 }
 
-/// Refine strict 3×3×3 extrema in the three interior response levels of an octave.
-pub(crate) fn find_extrema(levels: &[Plane], o: usize) -> Vec<Detection> {
+/// Append strict extrema from the middle response plane, in row-major scan order.
+/// `level_index` is its absolute octave index, independent of the rolling window.
+fn append_extrema(
+    levels: &[Plane; 3],
+    octave: usize,
+    level_index: usize,
+    out: &mut Vec<Detection>,
+) {
     let w = levels[0].width;
     let h = levels[0].height;
-    let mut out = Vec::new();
-    for z in 1..4 {
-        for y in 1..h - 1 {
-            'candidate: for x in 1..w - 1 {
-                let v = levels[z].values[y * w + x];
-                if (v as f64).abs() < 0.8 * (1e-5f32 as f64) {
-                    continue;
-                }
-                for dz in -1isize..=1 {
-                    for dy in -1isize..=1 {
-                        for dx in -1isize..=1 {
-                            if dx == 0 && dy == 0 && dz == 0 {
-                                continue;
-                            }
-                            let neighbor = levels[(z as isize + dz) as usize].values
-                                [(y as isize + dy) as usize * w + (x as isize + dx) as usize];
-                            if (v >= 0. && v <= neighbor) || (v < 0. && v >= neighbor) {
-                                continue 'candidate;
-                            }
+    debug_assert!(levels
+        .iter()
+        .all(|plane| (plane.width, plane.height) == (w, h)));
+    for y in 1..h - 1 {
+        let rows: [[&[f32]; 3]; 3] = std::array::from_fn(|scale| {
+            std::array::from_fn(|row| &levels[scale].values[(y + row - 1) * w..(y + row) * w])
+        });
+        'candidate: for x in 1..w - 1 {
+            let v = rows[1][1][x];
+            if (v as f64).abs() < 0.8 * (PEAK_THRESHOLD as f64) {
+                continue;
+            }
+            for (scale, plane_rows) in rows.iter().enumerate() {
+                for (row_index, row) in plane_rows.iter().enumerate() {
+                    for (column, &neighbor) in row[x - 1..x + 2].iter().enumerate() {
+                        if scale == 1 && row_index == 1 && column == 1 {
+                            continue;
+                        }
+                        if (v >= 0. && v <= neighbor) || (v < 0. && v >= neighbor) {
+                            continue 'candidate;
                         }
                     }
                 }
-                if let Some(d) = refine_extremum(levels, o, x, y, z) {
-                    out.push(d);
-                }
+            }
+            if let Some(d) = refine_extremum(levels, octave, x, y, level_index) {
+                out.push(d);
             }
         }
     }
-    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An analytic extremum keeps its absolute scale index as the response window moves.
+    #[test]
+    fn response_windows_preserve_absolute_scale_and_reject_equal_neighbors() {
+        for sign in [1., -1.] {
+            let mut levels = std::array::from_fn(|scale| {
+                Plane::from_values(
+                    9,
+                    9,
+                    (0..81)
+                        .map(|index| {
+                            let x = (index % 9) as f32 - 4.;
+                            let y = (index / 9) as f32 - 4.;
+                            let z = scale as f32 - 1.;
+                            sign * (10. - x * x - y * y - z * z)
+                        })
+                        .collect(),
+                )
+            });
+            let mut points = Vec::new();
+            for level in 1..pyramid::LEVELS_PER_OCTAVE - 1 {
+                append_extrema(&levels, 1, level, &mut points);
+            }
+            assert_eq!(points.len(), 3);
+            for point in &points {
+                assert_eq!((point.frame.x, point.frame.y, point.octave), (8., 8., 1));
+                assert_eq!(point.peak, sign * 10.);
+            }
+            assert!(points
+                .windows(2)
+                .all(|pair| pair[0].frame.a11 < pair[1].frame.a11));
+
+            // A neighbouring scale with an equal value disqualifies a strict extremum.
+            levels[0].values[4 * 9 + 4] = sign * 10.;
+            points.clear();
+            append_extrema(&levels, 1, 1, &mut points);
+            assert!(points.is_empty());
+        }
+    }
 }

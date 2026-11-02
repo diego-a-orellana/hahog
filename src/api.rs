@@ -1,6 +1,7 @@
 //! OpenCV-shaped API with pixel-coordinate keypoints and quantized histogram descriptors.
 use crate::algorithm::{
-    describe_frame, math, orient_detection, orientation, pyramid, selected_detections, Frame, Plane,
+    describe_frame, math, orient_detection, orientation, pyramid, selected_detections, Detection,
+    Frame, PatchWorkspace, Plane, DESCRIPTOR_LEN,
 };
 use crate::{Error, Result};
 use opencv::{core, imgproc, prelude::*};
@@ -10,12 +11,14 @@ use opencv::{core, imgproc, prelude::*};
 ///
 /// Images must be two-dimensional, at least 32 × 32 pixels, and have type
 /// `CV_8UC1`, `CV_8UC3` (BGR) or `CV_8UC4` (BGRA). Strided ROIs are supported.
-/// No resizing is performed. Empty images clear outputs; featureless images
-/// produce no detections. Invalid inputs return [`Error`] before replacing outputs.
+/// No resizing is performed. Empty images clear outputs after mask validation;
+/// featureless images produce no detections. Invalid inputs return [`Error`]
+/// before replacing outputs.
 ///
 /// Keypoints use pixel centers, diameter `2 × scale`, clockwise angles in
 /// `[0, 360)` degrees and zero-based pyramid octaves. This Rust type does not
 /// implement C++ `Feature2D` inheritance.
+#[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct Hahog;
 
@@ -30,7 +33,10 @@ impl Hahog {
     /// Detect oriented keypoints without computing descriptors.
     /// A nonempty mask selects centers and must match the image size and type `CV_8UC1`.
     /// Nonzero pixels select centers rounded to the nearest pixel with ties to even.
-    /// Invalid inputs leave `keypoints` unchanged; an empty image clears them.
+    /// Mask filtering follows the global 4000-detection budget; orientation patches
+    /// may sample outside the selected mask region. Masks are validated before
+    /// empty images clear outputs.
+    /// Invalid inputs leave `keypoints` unchanged.
     pub fn detect(
         &mut self,
         image: &impl core::ToInputArray,
@@ -38,25 +44,7 @@ impl Hahog {
         mask: &impl core::ToInputArray,
     ) -> Result<()> {
         let image = image.input_array()?.get_mat(-1)?;
-        let mask = mask.input_array()?.get_mat(-1)?;
-        validate_mask(&image, &mask)?;
-        let mut points = core::Vector::new();
-        if !image.empty() {
-            let pyramid = pyramid::Pyramid::build(&image_plane(&image)?);
-            for detection in selected_detections(&pyramid) {
-                if !mask_selects_center(&mask, detection.frame, image.cols(), image.rows())? {
-                    continue;
-                }
-                for detection in orient_detection(&pyramid, detection) {
-                    points.push(keypoint_from_frame(
-                        detection.frame,
-                        detection.peak,
-                        detection.octave,
-                    )?);
-                }
-            }
-        }
-        *keypoints = points;
+        *keypoints = visit_detected(&image, mask, |_, _, _| {})?;
         Ok(())
     }
 
@@ -75,7 +63,8 @@ impl Hahog {
     /// between `2 * f32::MIN_POSITIVE` and twice the larger image dimension.
     /// Angles must be `-1` or finite values in `[0, 360)` degrees. Supplied response,
     /// octave and class ID fields are retained.
-    /// Invalid inputs leave both outputs unchanged.
+    /// For nonempty images, frames are validated before pixels are normalized.
+    /// Invalid images or keypoints leave both outputs unchanged.
     /// Reconstructing frames from keypoint diameters and angles can change descriptor
     /// rounding. Use [`Self::detect_and_compute`] to preserve the native detector frames.
     pub fn compute(
@@ -89,7 +78,8 @@ impl Hahog {
 
     /// Detect and describe OpenCV pixels, or describe supplied pixel-coordinate frames.
     /// With `use_provided_keypoints = false`, applies the mask contract of [`Self::detect`].
-    /// With `true`, ignores the mask and applies the frame contract of [`Self::compute`].
+    /// Orientation and descriptor patches may sample outside the selected mask region.
+    /// With `true`, does not read or validate the mask and applies [`Self::compute`]'s frame contract.
     /// Each output keypoint has one corresponding 128-byte descriptor row.
     pub fn detect_and_compute(
         &mut self,
@@ -105,12 +95,22 @@ impl Hahog {
         } else {
             compute_detected(&image, mask)?
         };
-        let matrix = if rows.is_empty() {
-            core::Mat::default()
+        if rows.is_empty() {
+            core::Mat::default().copy_to(descriptors)?;
         } else {
-            core::Mat::from_slice_2d(&rows)?
-        };
-        matrix.copy_to(descriptors)?;
+            let row_count = i32::try_from(rows.len()).map_err(|_| {
+                opencv::Error::new(
+                    core::StsOutOfRange,
+                    "descriptor row count exceeds OpenCV limits",
+                )
+            })?;
+            let matrix = core::Mat::new_rows_cols_with_data(
+                row_count,
+                DESCRIPTOR_LEN as i32,
+                rows.as_flattened(),
+            )?;
+            matrix.copy_to(descriptors)?;
+        }
         *keypoints = points;
         Ok(())
     }
@@ -128,7 +128,7 @@ impl Hahog {
 
     /// Return the number of histogram bins per descriptor row.
     pub fn descriptor_size(&self) -> i32 {
-        128
+        DESCRIPTOR_LEN as i32
     }
 
     /// Return the OpenCV type of the quantized descriptor matrix.
@@ -143,19 +143,36 @@ impl Hahog {
 }
 
 /// Aligned OpenCV keypoints and descriptor rows, staged before replacing caller outputs.
-type Computed = (core::Vector<core::KeyPoint>, Vec<[u8; 128]>);
+type Computed = (core::Vector<core::KeyPoint>, Vec<[u8; DESCRIPTOR_LEN]>);
 
 /// Detect new keypoints after validating the selection mask and image pixels.
 fn compute_detected(image: &core::Mat, mask: &impl core::ToInputArray) -> Result<Computed> {
+    let mut rows = Vec::new();
+    let points = visit_detected(image, mask, |pyramid, detection, workspace| {
+        rows.push(describe_frame(pyramid, detection.frame, workspace));
+    })?;
+    Ok((points, rows))
+}
+
+/// Stage oriented keypoints, visiting each frame without requiring descriptor storage.
+fn visit_detected(
+    image: &core::Mat,
+    mask: &impl core::ToInputArray,
+    mut visit: impl FnMut(&pyramid::Pyramid, Detection, &mut PatchWorkspace),
+) -> Result<core::Vector<core::KeyPoint>> {
     let mask = mask.input_array()?.get_mat(-1)?;
     validate_mask(image, &mask)?;
     if image.empty() {
-        return Ok((core::Vector::new(), Vec::new()));
+        return Ok(core::Vector::new());
+    }
+    validate_image(image)?;
+    if !mask.empty() && core::count_non_zero(&mask)? == 0 {
+        return Ok(core::Vector::new());
     }
     let plane = image_plane(image)?;
     let pyramid = pyramid::Pyramid::build(&plane);
+    let mut workspace = PatchWorkspace::default();
     let mut points = core::Vector::new();
-    let mut rows = Vec::new();
     for detection in selected_detections(&pyramid) {
         if !mask_selects_center(
             &mask,
@@ -165,16 +182,16 @@ fn compute_detected(image: &core::Mat, mask: &impl core::ToInputArray) -> Result
         )? {
             continue;
         }
-        for detection in orient_detection(&pyramid, detection) {
+        for detection in orient_detection(&pyramid, detection, &mut workspace) {
             points.push(keypoint_from_frame(
                 detection.frame,
                 detection.peak,
                 detection.octave,
             )?);
-            rows.push(describe_frame(&pyramid, detection.frame));
+            visit(&pyramid, detection, &mut workspace);
         }
     }
-    Ok((points, rows))
+    Ok(points)
 }
 
 /// Describe supplied keypoints without reading or validating a selection mask.
@@ -185,38 +202,46 @@ fn compute_provided(
     if image.empty() {
         return Ok((core::Vector::new(), Vec::new()));
     }
-    let plane = image_plane(image)?;
+    validate_image(image)?;
+    validate_provided(image, keypoints)?;
     if keypoints.is_empty() {
         return Ok((core::Vector::new(), Vec::new()));
     }
-    validate_provided(&plane, keypoints)?;
+    let plane = image_plane(image)?;
     let pyramid = pyramid::Pyramid::build(&plane);
+    let mut workspace = PatchWorkspace::default();
     let mut points = core::Vector::new();
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(keypoints.len());
     for point in keypoints {
+        let center = point.pt();
+        let size = point.size();
+        let angle = point.angle();
         let frame = Frame {
-            x: point.pt().x,
-            y: point.pt().y,
-            a11: point.size() / 2.,
+            x: center.x,
+            y: center.y,
+            a11: size / 2.,
             a12: 0.,
             a21: 0.,
-            a22: point.size() / 2.,
+            a22: size / 2.,
         };
-        let angles = if point.angle() == -1. {
-            orientation::assign(&pyramid, frame)
-                .into_iter()
-                .map(|v| v[0])
-                .collect()
-        } else {
-            vec![(point.angle() as f64).to_radians()]
-        };
-        for angle in angles {
-            let mut oriented = point.clone();
-            if point.angle() == -1. {
+        if angle == -1. {
+            for angle in orientation::assign(&pyramid, frame, &mut workspace) {
+                let mut oriented = point.clone();
                 oriented.set_angle(math::positive_degrees(angle));
+                rows.push(describe_frame(
+                    &pyramid,
+                    orientation::rotate(frame, angle),
+                    &mut workspace,
+                ));
+                points.push(oriented);
             }
-            rows.push(describe_frame(&pyramid, orientation::rotate(frame, angle)));
-            points.push(oriented);
+        } else {
+            rows.push(describe_frame(
+                &pyramid,
+                orientation::rotate(frame, (angle as f64).to_radians()),
+                &mut workspace,
+            ));
+            points.push(point);
         }
     }
     Ok((points, rows))
@@ -242,8 +267,8 @@ fn validate_mask(image: &core::Mat, mask: &core::Mat) -> Result<()> {
     Ok(())
 }
 
-/// Validate and normalize pixels, converting BGR/BGRA only when necessary.
-fn image_plane(image: &core::Mat) -> Result<Plane> {
+/// Validate nonempty image dimensions and type without reading pixels.
+fn validate_image(image: &core::Mat) -> Result<()> {
     if image.dims() != 2 || image.rows() < 32 || image.cols() < 32 {
         return Err(Error::ImageShape {
             dimensions: image.dims(),
@@ -251,17 +276,26 @@ fn image_plane(image: &core::Mat) -> Result<Plane> {
             height: image.rows(),
         });
     }
-    let mut gray = core::Mat::default();
-    match image.typ() {
-        core::CV_8UC1 => return grayscale_plane(image),
-        core::CV_8UC3 => imgproc::cvt_color_def(image, &mut gray, imgproc::COLOR_BGR2GRAY)?,
-        core::CV_8UC4 => imgproc::cvt_color_def(image, &mut gray, imgproc::COLOR_BGRA2GRAY)?,
-        _ => {
-            return Err(Error::ImageType {
-                actual: image.typ(),
-            });
-        }
+    if !matches!(image.typ(), core::CV_8UC1 | core::CV_8UC3 | core::CV_8UC4) {
+        return Err(Error::ImageType {
+            actual: image.typ(),
+        });
     }
+    Ok(())
+}
+
+/// Normalize validated pixels, converting BGR/BGRA only when necessary.
+fn image_plane(image: &core::Mat) -> Result<Plane> {
+    if image.typ() == core::CV_8UC1 {
+        return grayscale_plane(image);
+    }
+    let conversion = if image.typ() == core::CV_8UC3 {
+        imgproc::COLOR_BGR2GRAY
+    } else {
+        imgproc::COLOR_BGRA2GRAY
+    };
+    let mut gray = core::Mat::default();
+    imgproc::cvt_color_def(image, &mut gray, conversion)?;
     grayscale_plane(&gray)
 }
 
@@ -293,28 +327,27 @@ fn keypoint_from_frame(frame: Frame, response: f32, octave: i32) -> Result<core:
 }
 
 /// Validate supplied center, diameter and orientation contracts before producing output.
-fn validate_provided(plane: &Plane, provided: &core::Vector<core::KeyPoint>) -> Result<()> {
-    let maximum_size = 2. * plane.width.max(plane.height) as f32;
+fn validate_provided(image: &core::Mat, provided: &core::Vector<core::KeyPoint>) -> Result<()> {
+    let width = image.cols() as f32;
+    let height = image.rows() as f32;
+    let maximum_size = 2. * width.max(height);
     for (index, point) in provided.iter().enumerate() {
         let p = point.pt();
         if !p.x.is_finite()
             || !p.y.is_finite()
             || p.x < 0.
-            || p.x >= plane.width as f32
+            || p.x >= width
             || p.y < 0.
-            || p.y >= plane.height as f32
+            || p.y >= height
         {
             return Err(Error::KeypointCenter { index });
         }
-        if !point.size().is_finite()
-            || point.size() < 2. * f32::MIN_POSITIVE
-            || point.size() > maximum_size
-        {
+        let size = point.size();
+        if !size.is_finite() || size < 2. * f32::MIN_POSITIVE || size > maximum_size {
             return Err(Error::KeypointSize { index });
         }
-        if !point.angle().is_finite()
-            || (point.angle() != -1. && !(0. ..360.).contains(&point.angle()))
-        {
+        let angle = point.angle();
+        if !angle.is_finite() || (angle != -1. && !(0. ..360.).contains(&angle)) {
             return Err(Error::KeypointAngle { index });
         }
     }
@@ -343,11 +376,11 @@ fn grayscale_plane(gray: &core::Mat) -> Result<Plane> {
         }
         values
     };
-    Ok(Plane {
-        width: gray.cols() as usize,
-        height: gray.rows() as usize,
+    Ok(Plane::from_values(
+        gray.cols() as usize,
+        gray.rows() as usize,
         values,
-    })
+    ))
 }
 
 #[cfg(test)]

@@ -1,0 +1,33 @@
+{
+  "reference": "Darwin qsort; OpenSfM hahog.cc select_best_features/run_features_selection",
+  "upstream_revision": "c4985ced723888d2529f9b7a1902d4aa682de1d0",
+  "platform": "Darwin arm64",
+  "macos": "26.7.1",
+  "feature_size": 48,
+  "peak_formula": "((input_id * 37 + 11) % 17) - 8 + 0.25 (float32)",
+  "caps": [
+    6000,
+    4000
+  ],
+  "encoding": "ordered input IDs as little-endian u32, without header",
+  "cases": [
+    {
+      "file": "selection-ties-4001.bin",
+      "inputs": 4001,
+      "features": 4000,
+      "sha256": "963328fed384cba823227ba5ffa6d10707955b49ee8cd88b2ad2f58c0ac99520"
+    },
+    {
+      "file": "selection-ties-6000.bin",
+      "inputs": 6000,
+      "features": 4000,
+      "sha256": "8fa40ecd2dee0ee2649cace32b82c4088ef11d6069bab9190b3df62c8ef8272b"
+    },
+    {
+      "file": "selection-ties-6001.bin",
+      "inputs": 6001,
+      "features": 4000,
+      "sha256": "265cd3a7a557e69277941084ede63796cfa10b436d28b8af6f7adcb05ebbc407"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 //! Validation failures and errors from the OpenCV image boundary.
 
 /// A failure to validate, detect or describe HAHOG features.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The image is not two-dimensional or is smaller than 32 × 32 pixels.
