@@ -22,6 +22,7 @@ include = [
     "/licenses/README.md",
     "/LICENSE",
     "/README.md",
+    "/CHANGELOG.md",
     "/CONTRIBUTING.md",
 ]
 
