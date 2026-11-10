@@ -57,6 +57,8 @@ pub(crate) struct PatchWorkspace {
     smoothed: Plane,
     /// Intermediate convolution pixels and kernel coefficients.
     blur: pyramid::GaussianBlur,
+    /// Row-major gradient magnitudes and angles, reused by both histogram stages.
+    gradients: Vec<[f32; 2]>,
 }
 
 /// Pixel center and row-major affine basis, before API-specific scale and angle conversion.
@@ -108,5 +110,8 @@ pub(crate) fn describe_frame(
         descriptor::PATCH_EXTENT,
         &mut workspace.patch,
     );
-    descriptor::quantize(descriptor::describe(&workspace.patch))
+    descriptor::quantize(descriptor::describe(
+        &workspace.patch,
+        &mut workspace.gradients,
+    ))
 }

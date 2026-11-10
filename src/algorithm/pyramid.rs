@@ -20,7 +20,7 @@ pub(crate) fn sigma(octave: usize, subdivision: i32) -> f64 {
 /// Reusable intermediate pixels and coefficients for Gaussian convolution.
 #[derive(Default)]
 pub(super) struct GaussianBlur {
-    /// Vertical-pass pixels, reset before each convolution.
+    /// Vertical-pass pixels, overwritten by each convolution.
     intermediate: Vec<f32>,
     /// Normalized weights for the current smoothing scale.
     kernel: Vec<f32>,
@@ -34,6 +34,11 @@ impl GaussianBlur {
         let h = input.height;
         debug_assert!(w > 0 && h > 0);
         debug_assert_eq!(input.values.len(), w * h);
+        // Keep small patch blurs on the simpler row loops.
+        if w >= 64 {
+            self.apply_blocked(input, sigma, output);
+            return;
+        }
         self.intermediate.clear();
         self.intermediate.resize(w * h, 0.);
         output.reset(w, h);
@@ -74,6 +79,87 @@ impl GaussianBlur {
                 for out in &mut destination[end..] {
                     *out = source[w - 1].mul_add(k, *out);
                 }
+            }
+        }
+    }
+
+    /// Accumulate wide rows in blocks to avoid storing every partial sum.
+    fn apply_blocked(&mut self, input: &Plane, sigma: f64, output: &mut Plane) {
+        const BLOCK: usize = 16;
+        let (w, h) = (input.width, input.height);
+        math::gaussian_kernel(sigma, &mut self.kernel);
+        let radius = self.kernel.len() / 2;
+        // Every pixel is assigned below, so reused storage need not be cleared.
+        self.intermediate.resize(w * h, 0.);
+        output.values.resize(w * h, 0.);
+        output.width = w;
+        output.height = h;
+
+        let mut rows = Vec::with_capacity(self.kernel.len());
+        for y in 0..h {
+            rows.clear();
+            for i in 0..self.kernel.len() {
+                let yy =
+                    (y as isize + i as isize - radius as isize).clamp(0, h as isize - 1) as usize;
+                rows.push(&input.values[yy * w..(yy + 1) * w]);
+            }
+            let row = &mut self.intermediate[y * w..(y + 1) * w];
+            let mut chunks = row.chunks_exact_mut(BLOCK);
+            for (block, out) in chunks.by_ref().enumerate() {
+                let x = block * BLOCK;
+                let mut sums = [0f32; BLOCK];
+                // Interleave independent pixels, retaining each pixel's FMA tap order.
+                for (source, &k) in rows.iter().zip(&self.kernel) {
+                    let source = &source[x..x + BLOCK];
+                    for lane in 0..BLOCK {
+                        sums[lane] = source[lane].mul_add(k, sums[lane]);
+                    }
+                }
+                out.copy_from_slice(&sums);
+            }
+            for (offset, out) in chunks.into_remainder().iter_mut().enumerate() {
+                let x = w / BLOCK * BLOCK + offset;
+                let mut sum = 0f32;
+                for (source, &k) in rows.iter().zip(&self.kernel) {
+                    sum = source[x].mul_add(k, sum);
+                }
+                *out = sum;
+            }
+        }
+        for y in 0..h {
+            let source = &self.intermediate[y * w..(y + 1) * w];
+            let row = &mut output.values[y * w..(y + 1) * w];
+            // Keep border ranges disjoint even when the kernel exceeds the image.
+            let start = radius.min(w);
+            let end = w.saturating_sub(radius).max(start);
+            for x in (0..start).chain(end..w) {
+                let mut sum = 0f32;
+                for (i, &k) in self.kernel.iter().enumerate() {
+                    let xx = (x as isize + i as isize - radius as isize).clamp(0, w as isize - 1)
+                        as usize;
+                    sum = source[xx].mul_add(k, sum);
+                }
+                row[x] = sum;
+            }
+            let mut chunks = row[start..end].chunks_exact_mut(BLOCK);
+            for (block, out) in chunks.by_ref().enumerate() {
+                let x = start + block * BLOCK;
+                let mut sums = [0f32; BLOCK];
+                for (i, &k) in self.kernel.iter().enumerate() {
+                    let source = &source[x + i - radius..x + i - radius + BLOCK];
+                    for lane in 0..BLOCK {
+                        sums[lane] = source[lane].mul_add(k, sums[lane]);
+                    }
+                }
+                out.copy_from_slice(&sums);
+            }
+            for (offset, out) in chunks.into_remainder().iter_mut().enumerate() {
+                let x = start + (end - start) / BLOCK * BLOCK + offset;
+                let mut sum = 0f32;
+                for (i, &k) in self.kernel.iter().enumerate() {
+                    sum = source[x + i - radius].mul_add(k, sum);
+                }
+                *out = sum;
             }
         }
     }
@@ -130,26 +216,71 @@ impl Pyramid {
 mod tests {
     use super::*;
 
-    /// Reuse must not retain pixels or coefficients when dimensions and sigma change.
+    /// Scalar vertical-first convolution with replicated borders and ordered FMA taps.
+    fn scalar_blur(input: &Plane, sigma: f64) -> Plane {
+        let (w, h) = (input.width, input.height);
+        let mut kernel = Vec::new();
+        math::gaussian_kernel(sigma, &mut kernel);
+        let radius = (kernel.len() / 2) as isize;
+        let mut intermediate = vec![0f32; w * h];
+        let mut values = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = 0f32;
+                for (i, &k) in kernel.iter().enumerate() {
+                    let yy = (y as isize + i as isize - radius).clamp(0, h as isize - 1) as usize;
+                    sum = input.values[yy * w + x].mul_add(k, sum);
+                }
+                intermediate[y * w + x] = sum;
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = 0f32;
+                for (i, &k) in kernel.iter().enumerate() {
+                    let xx = (x as isize + i as isize - radius).clamp(0, w as isize - 1) as usize;
+                    sum = intermediate[y * w + xx].mul_add(k, sum);
+                }
+                values[y * w + x] = sum;
+            }
+        }
+        Plane::from_values(w, h, values)
+    }
+
+    /// Cover both paths, full blocks, tails, oversized kernels, and reused storage.
     #[test]
-    fn reused_blur_matches_fresh_storage_across_sizes_and_scales() {
+    fn reused_blur_matches_scalar_bits_at_borders_and_block_boundaries() {
         let mut blur = GaussianBlur::default();
         let mut output = Plane::default();
-        for (width, height, sigma) in [(9, 7, 2.3), (2, 1, 4.), (1, 3, 0.), (9, 7, 2.3)] {
-            let input = Plane {
-                width,
-                height,
-                values: (0..width * height)
-                    .map(|i| ((i * 7 + 3) % 17) as f32 / 16.)
-                    .collect(),
-            };
-            let mut expected = Plane::default();
-            GaussianBlur::default().apply(&input, sigma, &mut expected);
-            blur.apply(&input, sigma, &mut output);
-            assert_eq!((output.width, output.height), (width, height));
-            assert_eq!(output.values.len(), expected.values.len());
-            for (actual, expected) in output.values.iter().zip(&expected.values) {
-                assert_eq!(actual.to_bits(), expected.to_bits());
+        for (case, width) in [
+            1, 63, 64, 65, 77, 78, 79, 80, 81, 82, 83, 128, 129, 64, 2, 81,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for height in [1, 5] {
+                let input = Plane::from_values(
+                    width,
+                    height,
+                    (0..width * height)
+                        .map(|i| ((i * 31 + case * 7) % 257) as f32 / 256.)
+                        .collect(),
+                );
+                for sigma in [0., 1., 2.3, 11., 32.] {
+                    let expected = scalar_blur(&input, sigma);
+                    blur.apply(&input, sigma, &mut output);
+                    assert_eq!((output.width, output.height), (width, height));
+                    assert_eq!(output.values.len(), expected.values.len());
+                    for (i, (actual, expected)) in
+                        output.values.iter().zip(&expected.values).enumerate()
+                    {
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "{width}x{height}, sigma {sigma}, pixel {i}"
+                        );
+                    }
+                }
             }
         }
     }

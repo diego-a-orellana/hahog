@@ -30,17 +30,6 @@ pub(crate) fn vlfeat_atan2(y: f32, x: f32) -> f32 {
     }
 }
 
-/// Wrap to [0, tau], retaining tau itself as required by histogram binning.
-pub(crate) fn mod_tau(mut x: f32) -> f32 {
-    while x > std::f32::consts::TAU {
-        x -= std::f32::consts::TAU;
-    }
-    while x < 0. {
-        x += std::f32::consts::TAU;
-    }
-    x
-}
-
 /// Pivoted elimination with the reference singularity cutoff and fused updates.
 pub(crate) fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
     if a.iter().flatten().chain(&b).any(|v| !v.is_finite()) {

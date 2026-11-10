@@ -45,7 +45,8 @@ pub(crate) fn assign(
         .apply(&workspace.patch, delta, &mut workspace.smoothed);
     let mut hist = [0f64; HISTOGRAM_BINS];
     let extent = std::f64::consts::TAU / HISTOGRAM_BINS as f64;
-    for (g, &w) in descriptor::gradients(&workspace.smoothed).zip(mask) {
+    descriptor::fill_gradients(&workspace.smoothed, &mut workspace.gradients);
+    for (g, &w) in workspace.gradients.iter().zip(mask) {
         let x = g[1] as f64 / extent;
         let bin = x.floor() as usize;
         let r = x - bin as f64;

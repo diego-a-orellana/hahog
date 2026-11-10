@@ -32,37 +32,54 @@ struct SpatialBins {
     y_weights: [f32; 2],
 }
 
-/// Yield row-major [magnitude, radians] pairs using one-sided border differences.
-pub(super) fn gradients(plane: &Plane) -> impl Iterator<Item = [f32; 2]> + '_ {
+/// Fill row-major [magnitude, radians] pairs for a plane at least 2×2.
+/// Separate border differences so the interior loop can vectorize independently.
+/// Histogram stages consume the completed buffer in their original order.
+pub(super) fn fill_gradients(plane: &Plane, output: &mut Vec<[f32; 2]>) {
     let w = plane.width;
     let h = plane.height;
-    let at = move |x, y| plane.values[y * w + x];
-    (0..h).flat_map(move |y| {
-        (0..w).map(move |x| {
-            let gx = if x == 0 {
-                at(1, y) - at(0, y)
-            } else if x + 1 == w {
-                at(x, y) - at(x - 1, y)
-            } else {
-                ((at(x + 1, y) - at(x - 1, y)) as f64 * 0.5) as f32
-            };
-            let gy = if y == 0 {
-                at(x, 1) - at(x, 0)
-            } else if y + 1 == h {
-                at(x, y) - at(x, y - 1)
-            } else {
-                ((at(x, y + 1) - at(x, y - 1)) as f64 * 0.5) as f32
-            };
-            [
-                math::vlfeat_sqrt(math::squared_norm2_fma(gx, gy)),
-                math::mod_tau((math::vlfeat_atan2(gy, gx) as f64 + std::f64::consts::TAU) as f32),
-            ]
-        })
-    })
+    debug_assert!(w >= 2 && h >= 2);
+    debug_assert_eq!(plane.values.len(), w * h);
+    output.resize(w * h, [0.; 2]);
+    for y in 0..h {
+        let above_y = y.saturating_sub(1);
+        let below_y = (y + 1).min(h - 1);
+        let above = &plane.values[above_y * w..(above_y + 1) * w];
+        let middle = &plane.values[y * w..(y + 1) * w];
+        let below = &plane.values[below_y * w..(below_y + 1) * w];
+        let factor = if y == 0 || y + 1 == h { 1. } else { 0.5 };
+        let row = &mut output[y * w..(y + 1) * w];
+        row[0] = gradient_magnitude_angle(
+            middle[1] - middle[0],
+            ((below[0] - above[0]) as f64 * factor) as f32,
+        );
+        for (i, gradient) in row[1..w - 1].iter_mut().enumerate() {
+            let x = i + 1;
+            let gx = ((middle[x + 1] - middle[x - 1]) as f64 * 0.5) as f32;
+            let gy = ((below[x] - above[x]) as f64 * factor) as f32;
+            *gradient = gradient_magnitude_angle(gx, gy);
+        }
+        row[w - 1] = gradient_magnitude_angle(
+            middle[w - 1] - middle[w - 2],
+            ((below[w - 1] - above[w - 1]) as f64 * factor) as f32,
+        );
+    }
+}
+
+/// Convert finite derivatives to reference magnitude and an angle in [0, tau].
+#[inline]
+fn gradient_magnitude_angle(gx: f32, gy: f32) -> [f32; 2] {
+    let magnitude = math::vlfeat_sqrt(math::squared_norm2_fma(gx, gy));
+    let mut angle = (math::vlfeat_atan2(gy, gx) as f64 + std::f64::consts::TAU) as f32;
+    // The shifted atan2 range needs at most one subtraction; retain tau itself.
+    if angle > std::f32::consts::TAU {
+        angle -= std::f32::consts::TAU;
+    }
+    [magnitude, angle]
 }
 
 /// Describe a 31×31 canonical patch with scale 2 and orientation pi/2.
-pub(super) fn describe(patch: &Plane) -> [f32; DESCRIPTOR_LEN] {
+pub(super) fn describe(patch: &Plane, gradients: &mut Vec<[f32; 2]>) -> [f32; DESCRIPTOR_LEN] {
     assert_eq!((patch.width, patch.height), (PATCH_SIDE, PATCH_SIDE));
     let mut d = [0f32; DESCRIPTOR_LEN];
     let angle0 = std::f64::consts::FRAC_PI_2;
@@ -105,20 +122,30 @@ pub(super) fn describe(patch: &Plane) -> [f32; DESCRIPTOR_LEN] {
             }
         })
     });
-    for ([modulus, angle], spatial) in gradients(patch).zip(spatial_bins) {
-        let theta = math::mod_tau((angle as f64 - angle0) as f32);
+    fill_gradients(patch, gradients);
+    for ([modulus, angle], spatial) in gradients.iter().copied().zip(spatial_bins) {
+        // Gradient angles lie in [0, tau]; this offset needs at most one addition.
+        let mut theta = (angle as f64 - angle0) as f32;
+        if theta < 0. {
+            theta += std::f32::consts::TAU;
+        }
         let nt = (ANGULAR_BINS as f64 * theta as f64 / std::f64::consts::TAU) as f32;
-        let bt = nt.floor() as i32;
+        let bt = nt.floor() as usize;
         let rt = nt - bt as f32;
+        let angular_bins = [bt % ANGULAR_BINS, (bt + 1) % ANGULAR_BINS];
+        let angular_weights = [(1. - rt).abs(), rt.abs()];
+        // Reuse multiplication prefixes without reassociating their factors.
+        let windowed = spatial.window * modulus;
         for (ix, &wx) in spatial.x_weights.iter().enumerate() {
+            let weighted_x = windowed * wx;
             for (iy, &wy) in spatial.y_weights.iter().enumerate() {
                 let base = spatial.bases[ix][iy];
                 if base == INVALID_BASE {
                     continue;
                 }
+                let weighted_xy = weighted_x * wy;
                 for it in 0..2 {
-                    let weight = spatial.window * modulus * wx * wy * (1. - it as f32 - rt).abs();
-                    d[base as usize + ((bt + it) % ANGULAR_BINS as i32) as usize] += weight;
+                    d[base as usize + angular_bins[it]] += weighted_xy * angular_weights[it];
                 }
             }
         }
@@ -134,4 +161,75 @@ pub(super) fn describe(patch: &Plane) -> [f32; DESCRIPTOR_LEN] {
 /// Apply the reference square-root transform, scale by 362 and round ties to even.
 pub(super) fn quantize(d: [f32; DESCRIPTOR_LEN]) -> [u8; DESCRIPTOR_LEN] {
     d.map(|v| (362. * v.sqrt()).clamp(0., 255.).round_ties_even() as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scalar reference wrapping retains tau itself for gradient comparisons.
+    fn reference_mod_tau(mut angle: f32) -> f32 {
+        while angle > std::f32::consts::TAU {
+            angle -= std::f32::consts::TAU;
+        }
+        while angle < 0. {
+            angle += std::f32::consts::TAU;
+        }
+        angle
+    }
+
+    /// Batching must preserve scalar rounding, border differences and reused pixels.
+    #[test]
+    fn batched_gradients_match_scalar_bits() {
+        let mut output = Vec::new();
+        for (w, h) in [(41, 41), (31, 31), (2, 2), (3, 7), (41, 41)] {
+            for scale in [0., 1., 1e-4, 1e-6, 1e-8] {
+                let mut state = 12345u32;
+                let values = (0..w * h)
+                    .map(|i| {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        if i % 19 == 0 {
+                            -0.
+                        } else {
+                            (state >> 8) as f32 / (1u32 << 24) as f32 * scale
+                        }
+                    })
+                    .collect();
+                let plane = Plane::from_values(w, h, values);
+                output.fill([f32::NAN; 2]);
+                fill_gradients(&plane, &mut output);
+                assert_eq!(output.len(), w * h);
+                let at = |x, y| plane.values[y * w + x];
+                for y in 0..h {
+                    for x in 0..w {
+                        let gx = if x == 0 {
+                            at(1, y) - at(0, y)
+                        } else if x + 1 == w {
+                            at(x, y) - at(x - 1, y)
+                        } else {
+                            ((at(x + 1, y) - at(x - 1, y)) as f64 * 0.5) as f32
+                        };
+                        let gy = if y == 0 {
+                            at(x, 1) - at(x, 0)
+                        } else if y + 1 == h {
+                            at(x, y) - at(x, y - 1)
+                        } else {
+                            ((at(x, y + 1) - at(x, y - 1)) as f64 * 0.5) as f32
+                        };
+                        let expected = [
+                            math::vlfeat_sqrt(math::squared_norm2_fma(gx, gy)),
+                            reference_mod_tau(
+                                (math::vlfeat_atan2(gy, gx) as f64 + std::f64::consts::TAU) as f32,
+                            ),
+                        ];
+                        assert_eq!(
+                            output[y * w + x].map(f32::to_bits),
+                            expected.map(f32::to_bits),
+                            "gradient at ({x}, {y}) in {w}×{h}, scale {scale}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
