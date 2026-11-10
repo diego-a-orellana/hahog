@@ -155,7 +155,9 @@ fn refine_extremum(
 pub(crate) fn detect(pyramid: &Pyramid) -> Vec<Detection> {
     let mut detections = Vec::new();
     let mut responses = std::array::from_fn(|_| Plane::default());
+    let mut candidates = Vec::new();
     for (octave, planes) in pyramid.octaves.iter().enumerate().rev() {
+        candidates.resize(planes[0].width - 2, false);
         for (index, (image, response)) in planes.iter().zip(&mut responses).enumerate() {
             hessian_response(
                 image,
@@ -176,18 +178,48 @@ pub(crate) fn detect(pyramid: &Pyramid) -> Vec<Detection> {
                     &mut responses[2],
                 );
             }
-            append_extrema(&responses, octave, level_index, &mut detections);
+            append_extrema(
+                &responses,
+                octave,
+                level_index,
+                &mut candidates,
+                &mut detections,
+            );
         }
     }
     detections
 }
 
+/// Mark interior pixels that pass the threshold and four spatial-neighbour checks.
+/// Eager boolean operations allow vectorization across independent pixels.
+fn prefilter_extrema_row([above, row, below]: [&[f32]; 3], candidates: &mut [bool]) {
+    debug_assert_eq!(above.len(), row.len());
+    debug_assert_eq!(below.len(), row.len());
+    debug_assert_eq!(candidates.len() + 2, row.len());
+    for (i, candidate) in candidates.iter_mut().enumerate() {
+        let x = i + 1;
+        let value = row[x];
+        let weak = (value as f64).abs() < 0.8 * (PEAK_THRESHOLD as f64);
+        let not_maximum = (value <= row[x - 1])
+            | (value <= row[x + 1])
+            | (value <= above[x])
+            | (value <= below[x]);
+        let not_minimum = (value >= row[x - 1])
+            | (value >= row[x + 1])
+            | (value >= above[x])
+            | (value >= below[x]);
+        *candidate = !weak & !(((value >= 0.) & not_maximum) | ((value < 0.) & not_minimum));
+    }
+}
+
 /// Append strict extrema from the middle response plane, in row-major scan order.
 /// `level_index` is its absolute octave index, independent of the rolling window.
+/// Reuse one candidate flag per interior column across rows and scale levels.
 fn append_extrema(
     levels: &[Plane; 3],
     octave: usize,
     level_index: usize,
+    candidates: &mut [bool],
     out: &mut Vec<Detection>,
 ) {
     let w = levels[0].width;
@@ -199,11 +231,20 @@ fn append_extrema(
         let rows: [[&[f32]; 3]; 3] = std::array::from_fn(|scale| {
             std::array::from_fn(|row| &levels[scale].values[(y + row - 1) * w..(y + row) * w])
         });
-        'candidate: for x in 1..w - 1 {
-            let v = rows[1][1][x];
-            if (v as f64).abs() < 0.8 * (PEAK_THRESHOLD as f64) {
+        // Skip weak rows without loading neighbours; stop at the first strong response.
+        if rows[1][1][1..w - 1]
+            .iter()
+            .all(|&value| (value as f64).abs() < 0.8 * (PEAK_THRESHOLD as f64))
+        {
+            continue;
+        }
+        prefilter_extrema_row(rows[1], candidates);
+        'candidate: for (i, &candidate) in candidates.iter().enumerate() {
+            if !candidate {
                 continue;
             }
+            let x = i + 1;
+            let v = rows[1][1][x];
             for (scale, plane_rows) in rows.iter().enumerate() {
                 for (row_index, row) in plane_rows.iter().enumerate() {
                     for (column, &neighbor) in row[x - 1..x + 2].iter().enumerate() {
@@ -227,6 +268,53 @@ fn append_extrema(
 mod tests {
     use super::*;
 
+    /// Row batching preserves strict comparisons, threshold rounding and scratch reuse.
+    #[test]
+    fn row_prefilter_matches_scalar_checks() {
+        let threshold = (0.8 * PEAK_THRESHOLD as f64) as f32;
+        let values = [
+            0.,
+            -0.,
+            threshold.next_down(),
+            threshold,
+            threshold.next_up(),
+            -threshold.next_down(),
+            -threshold,
+            -threshold.next_up(),
+            1.,
+            -1.,
+        ];
+        let mut state = 1729u32;
+        let mut candidates = Vec::new();
+        for width in [65, 3, 7, 15, 16, 17, 31, 32, 33, 65] {
+            let rows: [Vec<_>; 3] = std::array::from_fn(|_| {
+                (0..width)
+                    .map(|_| {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        values[(state >> 24) as usize % values.len()]
+                    })
+                    .collect()
+            });
+            candidates.resize(width - 2, true);
+            candidates.fill(true);
+            prefilter_extrema_row(rows.each_ref().map(Vec::as_slice), &mut candidates);
+            for (i, &candidate) in candidates.iter().enumerate() {
+                let x = i + 1;
+                let value = rows[1][x];
+                let neighbours = [rows[1][x - 1], rows[1][x + 1], rows[0][x], rows[2][x]];
+                let expected = (value as f64).abs() >= 0.8 * PEAK_THRESHOLD as f64
+                    && neighbours.iter().all(|&neighbour| {
+                        if value >= 0. {
+                            value > neighbour
+                        } else {
+                            value < neighbour
+                        }
+                    });
+                assert_eq!(candidate, expected, "width {width}, column {x}");
+            }
+        }
+    }
+
     /// An analytic extremum keeps its absolute scale index as the response window moves.
     #[test]
     fn response_windows_preserve_absolute_scale_and_reject_equal_neighbors() {
@@ -246,8 +334,9 @@ mod tests {
                 )
             });
             let mut points = Vec::new();
+            let mut candidates = [false; 7];
             for level in 1..pyramid::LEVELS_PER_OCTAVE - 1 {
-                append_extrema(&levels, 1, level, &mut points);
+                append_extrema(&levels, 1, level, &mut candidates, &mut points);
             }
             assert_eq!(points.len(), 3);
             for point in &points {
@@ -258,10 +347,29 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].frame.a11 < pair[1].frame.a11));
 
-            // A neighbouring scale with an equal value disqualifies a strict extremum.
-            levels[0].values[4 * 9 + 4] = sign * 10.;
+            // Equal values at any of the 26 neighbours disqualify a strict extremum.
+            for scale in 0..3 {
+                for y in 3..=5 {
+                    for x in 3..=5 {
+                        if (scale, x, y) == (1, 4, 4) {
+                            continue;
+                        }
+                        let index = y * 9 + x;
+                        let original = levels[scale].values[index];
+                        levels[scale].values[index] = sign * 10.;
+                        points.clear();
+                        append_extrema(&levels, 1, 1, &mut candidates, &mut points);
+                        assert!(points.is_empty(), "equal neighbour at ({scale}, {x}, {y})");
+                        levels[scale].values[index] = original;
+                    }
+                }
+            }
+            for plane in &mut levels {
+                plane.values.fill(0.);
+            }
+            candidates.fill(true);
             points.clear();
-            append_extrema(&levels, 1, 1, &mut points);
+            append_extrema(&levels, 1, 1, &mut candidates, &mut points);
             assert!(points.is_empty());
         }
     }
