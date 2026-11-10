@@ -1,6 +1,6 @@
 [package]
 name = "hahog"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Rust Hessian-and-gradient feature extraction with an OpenCV-compatible image API"
